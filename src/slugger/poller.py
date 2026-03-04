@@ -2,36 +2,37 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import signal
-import sys
 import time
 from pathlib import Path
 
 from slugger.config import SLUGGER_DIR, ensure_slugger_dir, load_config
-from slugger.models import JobStatus
+from slugger.models import JobStatus, TERMINAL_STATES, SluggerConfig
 from slugger.gsheet_sync import update_row
-from slugger.slurm import query_active_jobs, query_job_details
-from slugger.store import get_active_job_ids, get_job, save_job
+from slugger.slurm import query_active_jobs, query_job_details, _SLURM_STATE_MAP
+from slugger.store import get_active_job_ids, get_job, save_job, update_job_locked, prune_terminal_jobs
 
 logger = logging.getLogger("slugger")
 
 PID_FILE = SLUGGER_DIR / "poller.pid"
 LOG_FILE = SLUGGER_DIR / "slugger.log"
 
-# Terminal states that don't need further polling
-TERMINAL_STATES = {
-    JobStatus.COMPLETED,
-    JobStatus.FAILED,
-    JobStatus.TIMEOUT,
-    JobStatus.CANCELLED,
-}
+# Graceful shutdown flag — set by signal handler, checked in poll loop
+_shutdown = False
+
+# Prune terminal jobs every N poll cycles to bound store growth
+_PRUNE_EVERY_N_CYCLES = 100
 
 
 def _setup_logging() -> None:
     ensure_slugger_dir()
-    handler = logging.FileHandler(LOG_FILE)
+    handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3
+    )
     handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     )
@@ -41,10 +42,11 @@ def _setup_logging() -> None:
 
 
 def _write_pid() -> bool:
-    """Write PID file with restrictive permissions.
+    """Write PID file with process identity for reliable staleness detection.
 
     Returns True if this process now owns the PID file.
     """
+    content = json.dumps({"pid": os.getpid(), "start": time.time()})
     try:
         fd = os.open(str(PID_FILE), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
@@ -57,7 +59,7 @@ def _write_pid() -> bool:
             # Another process won the race — let it be the poller
             return False
     try:
-        os.write(fd, str(os.getpid()).encode())
+        os.write(fd, content.encode())
     finally:
         os.close(fd)
     return True
@@ -65,6 +67,16 @@ def _write_pid() -> bool:
 
 def _remove_pid() -> None:
     PID_FILE.unlink(missing_ok=True)
+
+
+def _is_slugger_process(pid: int) -> bool:
+    """Verify that a PID belongs to a slugger poller (not a recycled PID)."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read().decode("utf-8", errors="replace")
+        return "slugger" in cmdline
+    except OSError:
+        return False
 
 
 def get_poller_pid() -> int | None:
@@ -78,18 +90,30 @@ def get_poller_pid() -> int | None:
         return None
 
     try:
-        pid = int(PID_FILE.read_text().strip())
-    except (ValueError, OSError):
+        raw = PID_FILE.read_text().strip()
+        # Support both legacy (plain PID) and new (JSON) formats
+        if raw.startswith("{"):
+            data = json.loads(raw)
+            pid = int(data["pid"])
+        else:
+            pid = int(raw)
+    except (ValueError, OSError, json.JSONDecodeError, KeyError):
         return None
 
     # Check if process is alive
     try:
         os.kill(pid, 0)
-        return pid
     except OSError:
-        # Stale PID file
+        # Process is dead — stale PID file
         _remove_pid()
         return None
+
+    # Verify it's actually a slugger process (prevent PID recycling false positive)
+    if not _is_slugger_process(pid):
+        _remove_pid()
+        return None
+
+    return pid
 
 
 def is_running() -> bool:
@@ -143,18 +167,21 @@ def _daemonize() -> None:
     os.dup2(devnull, 2)
     os.close(devnull)
 
+    # Ignore SIGHUP — daemon should not die on terminal hangup
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
     # Run the polling loop
     _setup_logging()
     if not _write_pid():
         # Another poller owns the PID file — exit to prevent orphan daemon
         os._exit(0)
 
-    def handle_sigterm(_signum, _frame):
-        logger.info("Poller stopping (SIGTERM)")
-        _remove_pid()
-        sys.exit(0)
+    def _handle_sigterm(_signum, _frame):
+        global _shutdown
+        logger.info("Poller received SIGTERM, shutting down gracefully")
+        _shutdown = True
 
-    signal.signal(signal.SIGTERM, handle_sigterm)
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     logger.info("Poller started (PID %d)", os.getpid())
 
@@ -178,19 +205,33 @@ def start_poller() -> bool:
 
 
 def _poll_loop() -> None:
-    """Main polling loop — reloads config each cycle for live updates."""
-    while True:
+    """Main polling loop — reloads config each cycle, checks shutdown flag."""
+    cycle_count = 0
+    while not _shutdown:
         config = load_config()
         try:
             _poll_once(config)
         except Exception:
             logger.exception("Poll cycle error")
 
-        time.sleep(config.poll_interval_sec)
+        cycle_count += 1
+        # Periodically prune old terminal jobs to bound store growth
+        if cycle_count % _PRUNE_EVERY_N_CYCLES == 0:
+            try:
+                pruned = prune_terminal_jobs()
+                if pruned > 0:
+                    logger.info("Pruned %d old terminal jobs from store", pruned)
+            except Exception:
+                logger.exception("Prune error")
+
+        # Sleep in small increments to respond to shutdown quickly
+        deadline = time.monotonic() + config.poll_interval_sec
+        while not _shutdown and time.monotonic() < deadline:
+            time.sleep(min(1.0, deadline - time.monotonic()))
 
 
-def _poll_once(config) -> None:
-    """Run a single poll cycle."""
+def _poll_once(config: SluggerConfig) -> None:
+    """Run a single poll cycle using locked read-modify-write for each job."""
     active_ids = get_active_job_ids()
     if not active_ids:
         return
@@ -204,44 +245,63 @@ def _poll_once(config) -> None:
         return
 
     for job_id in active_ids:
+        if _shutdown:
+            return
+
         job = get_job(job_id)
         if job is None:
             continue
 
         if job_id in squeue_states:
-            # Job is still in queue — update state if changed
-            new_state_str = squeue_states[job_id]
-            new_status = _map_squeue_state(new_state_str)
-            # Don't overwrite valid status with UNKNOWN from unrecognized squeue states
-            if new_status != job.status and new_status != JobStatus.UNKNOWN:
-                old_status = job.status
-                job = job.with_update(status=new_status)
-                save_job(job)
-                update_row(job, config)
-                logger.info("Job %s: %s -> %s", job_id, old_status.value, new_status.value)
+            _handle_active_job(job, squeue_states[job_id], config)
         else:
-            # Job disappeared from squeue — check sacct for final state
-            details = query_job_details(job_id)
-            if details:
-                updates = {k: v for k, v in details.items() if v is not None and k != "job_id"}
-                job = job.with_update(**updates)
-                save_job(job)
-                update_row(job, config)
-                logger.info("Job %s finished: %s", job_id, job.status.value)
-            else:
-                # sacct also returned nothing — don't mark UNKNOWN immediately,
-                # wait for next cycle (transient SLURM issue)
-                logger.warning("Job %s: not in squeue, no sacct data — will retry next cycle", job_id)
+            _handle_finished_job(job, config)
 
 
-def _map_squeue_state(state: str) -> JobStatus:
-    mapping = {
-        "PENDING": JobStatus.PENDING,
-        "RUNNING": JobStatus.RUNNING,
-        "COMPLETING": JobStatus.RUNNING,
-        "CONFIGURING": JobStatus.PENDING,
-        "SUSPENDED": JobStatus.PENDING,
-        "REQUEUED": JobStatus.PENDING,
-        "RESIZING": JobStatus.RUNNING,
-    }
-    return mapping.get(state.upper(), JobStatus.UNKNOWN)
+def _handle_active_job(job, sq_info: dict[str, str], config: SluggerConfig) -> None:
+    """Handle a job that is still in squeue."""
+    new_status = _SLURM_STATE_MAP.get(sq_info["state"].upper(), JobStatus.UNKNOWN)
+    node = sq_info.get("node", "") or None
+    # Don't overwrite valid status with UNKNOWN from unrecognized squeue states
+    changed = (new_status != job.status and new_status != JobStatus.UNKNOWN)
+    node_changed = (node and node != job.node)
+
+    if not (changed or node_changed):
+        return
+
+    old_status = job.status
+    updates: dict[str, object] = {}
+    if changed:
+        updates["status"] = new_status
+    if node_changed:
+        updates["node"] = node
+
+    # Enrich with sacct details when transitioning to RUNNING
+    if changed and new_status == JobStatus.RUNNING:
+        details = query_job_details(job.job_id)
+        if details:
+            for k, v in details.items():
+                if v is not None and k != "job_id":
+                    updates.setdefault(k, v)
+
+    # Use locked read-modify-write to prevent lost updates
+    updated = update_job_locked(job.job_id, lambda j: j.with_update(**updates))
+    if updated:
+        update_row(updated, config)
+        if changed:
+            logger.info("Job %s: %s -> %s", job.job_id, old_status.value, new_status.value)
+
+
+def _handle_finished_job(job, config: SluggerConfig) -> None:
+    """Handle a job that disappeared from squeue — check sacct for final state."""
+    details = query_job_details(job.job_id)
+    if details:
+        updates = {k: v for k, v in details.items() if v is not None and k != "job_id"}
+        updated = update_job_locked(job.job_id, lambda j: j.with_update(**updates))
+        if updated:
+            update_row(updated, config)
+            logger.info("Job %s finished: %s", job.job_id, updated.status.value)
+    else:
+        # sacct also returned nothing — don't mark UNKNOWN immediately,
+        # wait for next cycle (transient SLURM issue)
+        logger.warning("Job %s: not in squeue, no sacct data — will retry next cycle", job.job_id)

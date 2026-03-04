@@ -238,9 +238,9 @@ def submit_job(
     if gpus is None:
         gpus = sbatch_meta.get("gpus")
 
-    # Resolve output/error paths — %j → job_id, make absolute
-    stdout_path = _resolve_slurm_path(sbatch_directives.get("--output", ""), job_id)
-    stderr_path = _resolve_slurm_path(sbatch_directives.get("--error", ""), job_id)
+    # Resolve output/error paths — %j → job_id, %x → job_name, make absolute
+    stdout_path = _resolve_slurm_path(sbatch_directives.get("--output", ""), job_id, job_name)
+    stderr_path = _resolve_slurm_path(sbatch_directives.get("--error", ""), job_id, job_name)
 
     return Job(
         job_id=job_id,
@@ -259,19 +259,25 @@ def submit_job(
 
 # ── SLURM queries ──────────────────────────────────────────────────────────
 
-def query_active_jobs() -> dict[str, str] | None:
-    """Query squeue for active jobs. Returns {job_id: state}, or None on failure."""
-    cmd = ["squeue", "--me", "--noheader", "--format=%i|%T"]
+def query_active_jobs() -> dict[str, dict[str, str]] | None:
+    """Query squeue for active jobs.
+
+    Returns {job_id: {"state": ..., "node": ...}}, or None on failure.
+    """
+    cmd = ["squeue", "--me", "--noheader", "--format=%i|%T|%N"]
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
 
     if result.returncode != 0:
         return None  # squeue failed — caller should skip this cycle
 
-    jobs: dict[str, str] = {}
+    jobs: dict[str, dict[str, str]] = {}
     for line in result.stdout.strip().splitlines():
         parts = line.strip().split("|")
-        if len(parts) == 2:
-            jobs[parts[0].strip()] = parts[1].strip()
+        if len(parts) >= 2:
+            job_id = parts[0].strip()
+            state = parts[1].strip()
+            node = parts[2].strip() if len(parts) >= 3 else ""
+            jobs[job_id] = {"state": state, "node": node}
     return jobs
 
 
@@ -372,26 +378,34 @@ def _parse_memory(mem_str: str) -> Optional[int]:
     return max(1, int(result)) if result > 0 else 0
 
 
+# Hoisted to module level to avoid rebuilding on every call
+_SLURM_STATE_MAP: dict[str, JobStatus] = {
+    "PENDING": JobStatus.PENDING,
+    "RUNNING": JobStatus.RUNNING,
+    "COMPLETED": JobStatus.COMPLETED,
+    "FAILED": JobStatus.FAILED,
+    "TIMEOUT": JobStatus.TIMEOUT,
+    "CANCELLED": JobStatus.CANCELLED,
+    "CANCELED": JobStatus.CANCELLED,
+    "NODE_FAIL": JobStatus.FAILED,
+    "BOOT_FAIL": JobStatus.FAILED,
+    "PREEMPTED": JobStatus.CANCELLED,
+    "OUT_OF_MEMORY": JobStatus.FAILED,
+    "DEADLINE": JobStatus.TIMEOUT,
+    "REQUEUED": JobStatus.PENDING,
+    # squeue-specific states (also useful when called from poller)
+    "COMPLETING": JobStatus.RUNNING,
+    "CONFIGURING": JobStatus.PENDING,
+    "SUSPENDED": JobStatus.PENDING,
+    "RESIZING": JobStatus.RUNNING,
+}
+
+
 def _map_slurm_state(state: str) -> JobStatus:
     """Map SLURM state strings to JobStatus enum."""
     state = state.split()[0] if state else ""  # Handle "CANCELLED by ..."
     state = state.rstrip("+")  # SLURM appends + when not all processes exited cleanly
-    mapping = {
-        "PENDING": JobStatus.PENDING,
-        "RUNNING": JobStatus.RUNNING,
-        "COMPLETED": JobStatus.COMPLETED,
-        "FAILED": JobStatus.FAILED,
-        "TIMEOUT": JobStatus.TIMEOUT,
-        "CANCELLED": JobStatus.CANCELLED,
-        "CANCELED": JobStatus.CANCELLED,
-        "NODE_FAIL": JobStatus.FAILED,
-        "BOOT_FAIL": JobStatus.FAILED,
-        "PREEMPTED": JobStatus.CANCELLED,
-        "OUT_OF_MEMORY": JobStatus.FAILED,
-        "DEADLINE": JobStatus.TIMEOUT,
-        "REQUEUED": JobStatus.PENDING,
-    }
-    return mapping.get(state.upper(), JobStatus.UNKNOWN)
+    return _SLURM_STATE_MAP.get(state.upper(), JobStatus.UNKNOWN)
 
 
 def _extract_job_name(args: list[str], fallback: str) -> str:
@@ -423,11 +437,17 @@ def _extract_gpu_count(args: list[str]) -> Optional[int]:
     return None
 
 
-def _resolve_slurm_path(raw: str, job_id: str) -> str:
-    """Resolve SLURM output path: replace %j with job_id, make absolute."""
+def _resolve_slurm_path(raw: str, job_id: str, job_name: str = "") -> str:
+    """Resolve SLURM output path: replace %j/%x with actual values, make absolute.
+
+    Handles: %j (job ID), %x (job name). Unresolved patterns are left as-is
+    since SLURM will resolve them at runtime (e.g., %N for node name).
+    """
     if not raw:
         return ""
     resolved = raw.replace("%j", job_id)
+    if job_name:
+        resolved = resolved.replace("%x", job_name)
     p = Path(resolved)
     if not p.is_absolute():
         p = Path.cwd() / p

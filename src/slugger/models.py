@@ -17,6 +17,15 @@ class JobStatus(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
+# Terminal states that don't need further polling
+TERMINAL_STATES = {
+    JobStatus.COMPLETED,
+    JobStatus.FAILED,
+    JobStatus.TIMEOUT,
+    JobStatus.CANCELLED,
+}
+
+
 @dataclass(frozen=True)
 class Job:
     job_id: str

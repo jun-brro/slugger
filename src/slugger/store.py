@@ -1,64 +1,152 @@
-"""Local JSON store for job persistence with atomic writes."""
+"""Local JSON store for job persistence with atomic writes and proper locking."""
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
+import logging
 import os
+import shutil
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from slugger.config import ensure_slugger_dir
-from slugger.models import Job, JobStatus
+from slugger.models import Job, JobStatus, TERMINAL_STATES
 
-# Terminal states excluded from active listings
-TERMINAL_STATES = {
-    JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.TIMEOUT, JobStatus.CANCELLED,
-}
+logger = logging.getLogger("slugger")
+
+# Maximum number of terminal (finished) jobs to keep in the store.
+# Active jobs are never pruned.
+_MAX_TERMINAL_JOBS = 5000
 
 
 def _jobs_path() -> Path:
     return ensure_slugger_dir() / "jobs.json"
 
 
-def _load_raw() -> list[dict]:
+def _lock_path() -> Path:
+    return _jobs_path().with_suffix(".lock")
+
+
+@contextlib.contextmanager
+def _shared_lock():
+    """Acquire a shared (read) lock on the jobs store."""
+    lp = _lock_path()
+    ensure_slugger_dir()
+    with open(lp, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _exclusive_lock():
+    """Acquire an exclusive (write) lock on the jobs store."""
+    lp = _lock_path()
+    ensure_slugger_dir()
+    with open(lp, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _load_raw_unlocked() -> list[dict]:
+    """Load raw job data from disk. Caller must hold at least a shared lock."""
     path = _jobs_path()
     if not path.exists():
         return []
     try:
         data = json.loads(path.read_text())
         return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, OSError):
+    except json.JSONDecodeError:
+        # Preserve corrupted file for recovery
+        backup = path.with_suffix(".json.corrupt")
+        if not backup.exists():
+            shutil.copy2(path, backup)
+        logger.warning("Corrupted jobs.json — backup saved to %s", backup)
+        return []
+    except OSError:
         return []
 
 
-def save_job(job: Job) -> None:
-    """Save or update a job in the store."""
-    path = _jobs_path()
-    lock_path = path.with_suffix(".lock")
-    ensure_slugger_dir()
+def _load_raw() -> list[dict]:
+    """Load raw job data with a shared lock for consistency."""
+    with _shared_lock():
+        return _load_raw_unlocked()
 
-    with open(lock_path, "w") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
-        try:
-            # Re-read inside lock to prevent lost updates
-            jobs = _load_raw()
-            new_data = job.to_dict()
-            updated = any(j.get("job_id") == job.job_id for j in jobs)
-            result = [
-                new_data if j.get("job_id") == job.job_id else j
-                for j in jobs
-            ]
-            if not updated:
-                result = [*result, new_data]
-            _save_raw_unlocked(result, path)
-        finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+def save_job(job: Job) -> None:
+    """Save or update a job in the store (atomic, exclusive-locked)."""
+    path = _jobs_path()
+
+    with _exclusive_lock():
+        jobs = _load_raw_unlocked()
+        new_data = job.to_dict()
+        updated = any(j.get("job_id") == job.job_id for j in jobs)
+        result = [
+            new_data if j.get("job_id") == job.job_id else j
+            for j in jobs
+        ]
+        if not updated:
+            result = [*result, new_data]
+        _save_raw_unlocked(result, path)
+
+
+def update_job_locked(job_id: str, updater: Callable[[Job], Job]) -> Optional[Job]:
+    """Read-modify-write a single job under exclusive lock.
+
+    Prevents lost updates when poller and CLI modify the same job concurrently.
+    Returns the updated Job, or None if not found.
+    """
+    path = _jobs_path()
+
+    with _exclusive_lock():
+        jobs = _load_raw_unlocked()
+        target_idx = None
+        for i, j in enumerate(jobs):
+            if j.get("job_id") == job_id:
+                target_idx = i
+                break
+
+        if target_idx is None:
+            return None
+
+        old_job = Job.from_dict(jobs[target_idx])
+        new_job = updater(old_job)
+        jobs[target_idx] = new_job.to_dict()
+        _save_raw_unlocked(jobs, path)
+        return new_job
+
+
+def prune_terminal_jobs(max_terminal: int = _MAX_TERMINAL_JOBS) -> int:
+    """Remove oldest terminal jobs exceeding the cap. Returns count pruned."""
+    path = _jobs_path()
+
+    with _exclusive_lock():
+        jobs = _load_raw_unlocked()
+        terminal_indices = [
+            i for i, j in enumerate(jobs)
+            if j.get("status") in {s.value for s in TERMINAL_STATES}
+        ]
+
+        if len(terminal_indices) <= max_terminal:
+            return 0
+
+        # Remove oldest terminal jobs (they appear first in the list)
+        to_remove = set(terminal_indices[:len(terminal_indices) - max_terminal])
+        pruned = [j for i, j in enumerate(jobs) if i not in to_remove]
+        _save_raw_unlocked(pruned, path)
+        return len(to_remove)
 
 
 def _save_raw_unlocked(jobs: list[dict], path: Path) -> None:
-    """Write jobs to disk without acquiring lock (caller must hold lock)."""
+    """Write jobs to disk atomically. Caller must hold exclusive lock."""
     fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
         os.fchmod(fd, 0o600)
@@ -123,12 +211,15 @@ def list_all_jobs(limit: int = 0, project: str = "") -> list[Job]:
     """
     raw = list(reversed(_load_raw()))
 
-    jobs = [Job.from_dict(j) for j in raw]
-    if project:
-        jobs = [j for j in jobs if j.project == project]
-    if limit:
-        jobs = jobs[:limit]
-    return jobs
+    result: list[Job] = []
+    for j in raw:
+        job = Job.from_dict(j)
+        if project and job.project != project:
+            continue
+        result.append(job)
+        if limit and len(result) >= limit:
+            break
+    return result
 
 
 def get_active_job_ids(project: str = "") -> list[str]:

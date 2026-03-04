@@ -23,13 +23,14 @@ def _sanitize_cell(val: object) -> object:
     """Prevent formula injection in Google Sheets cells.
 
     Prefixes dangerous first-characters with ' to force text interpretation.
-    Also strips control characters that could be used to bypass sanitization.
+    Strips all leading whitespace and control characters before checking.
     """
     if isinstance(val, str) and val:
-        # Strip leading control characters that could mask formula prefixes
-        stripped = val.lstrip("\t\r\n")
+        # Strip ALL leading whitespace and control characters
+        stripped = val.lstrip(" \t\r\n")
         if stripped and stripped[0] in ("=", "+", "-", "@"):
             return "'" + val
+        # Catch raw control characters at start (tab, cr, lf)
         if val[0] in _FORMULA_PREFIXES:
             return "'" + val
     return val
@@ -104,7 +105,7 @@ def create_row(job: Job, config: SluggerConfig) -> Optional[int]:
 
     try:
         ws = _get_sheet(config, job.project)
-        ws.append_row(_job_to_row(job), value_input_option="USER_ENTERED")
+        ws.append_row(_job_to_row(job), value_input_option="RAW")
         row = _find_row(ws, job.job_id)
         logger.info("Created sheet row %s for job %s (tab: %s)", row, job.job_id, job.project or "default")
         return row
@@ -131,7 +132,7 @@ def update_row(job: Job, config: SluggerConfig) -> bool:
         if not row:
             return False
 
-        ws.update(f"A{row}", [_job_to_row(job)], value_input_option="USER_ENTERED")
+        ws.update(f"A{row}", [_job_to_row(job)], value_input_option="RAW")
         logger.info("Updated sheet row %s for job %s", row, job.job_id)
         return True
     except Exception as e:

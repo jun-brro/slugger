@@ -381,11 +381,12 @@ def run_monitor(refresh_sec: float = 5.0, limit: int = 50, project: str = "") ->
             screen=True,
         ) as live:
             while True:
-                elapsed = 0.0
                 step = 0.03
                 force_refresh = False
-                while elapsed < refresh_sec:
-                    key = _read_key_raw(fd, step)
+                deadline = time.monotonic() + refresh_sec
+                while time.monotonic() < deadline:
+                    remaining = deadline - time.monotonic()
+                    key = _read_key_raw(fd, min(step, max(0, remaining)))
                     if key is not None:
                         active = _get_active_jobs(jobs)
                         n_active = len(active)
@@ -432,9 +433,7 @@ def run_monitor(refresh_sec: float = 5.0, limit: int = 50, project: str = "") ->
                             force_refresh = True
                             break
 
-                    elapsed += step
-
-                if force_refresh or elapsed >= refresh_sec:
+                if force_refresh or time.monotonic() >= deadline:
                     jobs = list_all_jobs(limit=limit, project=project)
 
                 # Clamp selection to current active count

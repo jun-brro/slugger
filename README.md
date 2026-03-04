@@ -104,7 +104,7 @@ slugger gpu [JOB_ID] [-t TOOL]
 | `JOB_ID` | Job ID (default: latest running job) |
 | `-t, --tool` | `nvitop` (default) or `nvidia-smi` |
 
-SSH to the job's compute node and launch GPU monitor.
+Run GPU monitor on the job's compute node via `srun --jobid`.
 
 ### `slugger login` / `slugger init`
 

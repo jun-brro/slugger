@@ -224,6 +224,17 @@ def login() -> None:
     if not src.exists():
         console.print(f"[red]File not found:[/red] {src}")
         raise typer.Exit(1)
+    if src.is_symlink():
+        console.print("[red]Will not copy symlinks for security. Provide the actual file path.[/red]")
+        raise typer.Exit(1)
+
+    # Validate it's actually JSON before copying
+    import json as _json
+    try:
+        _json.loads(src.read_text())
+    except (ValueError, UnicodeDecodeError):
+        console.print("[red]File is not valid JSON.[/red]")
+        raise typer.Exit(1)
 
     # Copy to ~/.slugger/credentials.json with restrictive permissions
     if src != CREDENTIALS_PATH:
@@ -274,14 +285,22 @@ def login() -> None:
             console.print("[red]Could not connect. Check credentials and spreadsheet sharing.[/red]")
             raise typer.Exit(1)
 
-    # Save config with restrictive permissions
+    # Save config atomically with restrictive permissions
+    import tempfile
     content = (
         f'google_credentials = "{CREDENTIALS_PATH}"\n'
         f'spreadsheet_id = "{spreadsheet_id}"\n'
         f'poll_interval_sec = 60\n'
     )
-    CONFIG_PATH.write_text(content)
-    os.chmod(CONFIG_PATH, 0o600)
+    fd, tmp_path = tempfile.mkstemp(dir=CONFIG_PATH.parent, suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with open(fd, "w") as f:
+            f.write(content)
+        Path(tmp_path).replace(CONFIG_PATH)
+    except Exception:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
 
     # Apply conditional formatting for status badges
     if sheet_title:
@@ -325,8 +344,7 @@ def log(
     """Tail a job's output log (like tail -f)."""
     from slugger.models import JobStatus
 
-    if lines < 1:
-        lines = 1
+    lines = max(1, min(lines, 10000))
     if job_id and not validate_job_id(job_id):
         console.print(f"[red]Invalid job ID:[/red] {job_id}")
         raise typer.Exit(1)
@@ -374,7 +392,7 @@ def gpu(
     job_id: Optional[str] = typer.Argument(None, help="Job ID (default: latest running job)"),
     tool: str = typer.Option("nvitop", "--tool", "-t", help="GPU tool: nvitop or nvidia-smi"),
 ) -> None:
-    """Open GPU monitor on a job's compute node via SSH."""
+    """Open GPU monitor on a job's compute node via srun."""
     from slugger.models import JobStatus
 
     # Find the job
@@ -419,13 +437,13 @@ def gpu(
         console.print(f"[red]Invalid node name:[/red] {node}")
         raise typer.Exit(1)
 
-    # Build SSH command — replace current process
+    # Use srun to execute on the job's allocated node (no SSH keys needed)
     if tool == "nvitop":
-        ssh_cmd = ["ssh", "-t", node, "nvitop"]
+        srun_cmd = ["srun", "--jobid", job.job_id, "--overlap", "--pty", "nvitop"]
     else:
-        ssh_cmd = ["ssh", "-t", node, "watch", "-n1", "nvidia-smi"]
+        srun_cmd = ["srun", "--jobid", job.job_id, "--overlap", "--pty", "watch", "-n1", "nvidia-smi"]
 
-    os.execvp("ssh", ssh_cmd)
+    os.execvp("srun", srun_cmd)
 
 
 @app.command()
