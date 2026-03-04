@@ -3,3 +3,9 @@
 CLAUDE.md
 .env
 __pycache__
+*.egg-info
+dist/
+build/
+.venv/
+*.pyc
+.ruff_cache/
