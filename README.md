@@ -117,10 +117,33 @@ Interactive setup wizard: paste service account JSON path and spreadsheet URL. C
 ### `slugger sync`
 
 ```
-slugger sync [JOB_ID] [-p PROJECT]
+slugger sync [JOB_ID] [-p PROJECT] [-a] [--unsynced]
 ```
 
-Force sync to Google Sheets. No args = sync all active jobs in current project.
+| Arg | Description |
+|-----|-------------|
+| `JOB_ID` | Sync a single job |
+| `-p, --project` | Filter by project |
+| `-a, --all` | Sync all jobs (including completed) |
+| `--unsynced` | Sync only jobs not yet in the sheet |
+
+No args = sync all active jobs in current project.
+
+```bash
+# Push jobs that were submitted before sheet was linked
+slugger sync --unsynced
+
+# Re-sync everything
+slugger sync --all
+```
+
+### `slugger sheet info`
+
+```
+slugger sheet info
+```
+
+Show connected spreadsheet details: title, URL, worksheet tabs with job counts, and unsynced jobs summary.
 
 ### `slugger poller`
 

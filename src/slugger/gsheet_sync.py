@@ -269,6 +269,34 @@ def _apply_worksheet_formatting(ws, sh) -> None:
     logger.info("Applied formatting to worksheet '%s'", ws.title)
 
 
+def get_spreadsheet_info(config: SluggerConfig) -> Optional[dict]:
+    """Get spreadsheet metadata: title, URL, and worksheet tabs with row counts.
+
+    Returns dict with keys: title, url, worksheets (list of {name, rows}).
+    Returns None on failure.
+    """
+    if not config.sheet_configured:
+        return None
+
+    try:
+        sh = _open_spreadsheet(config)
+        worksheets: list[dict[str, object]] = []
+        for ws in sh.worksheets():
+            # Count data rows (subtract 1 for header if exists)
+            col_a = ws.col_values(1)
+            data_rows = max(0, len(col_a) - 1) if col_a else 0
+            worksheets.append({"name": ws.title, "rows": data_rows})
+
+        return {
+            "title": sh.title,
+            "url": sh.url,
+            "worksheets": worksheets,
+        }
+    except Exception as e:
+        logger.warning("Failed to get spreadsheet info: %s", e)
+        return None
+
+
 def _find_row(ws, job_id: str) -> Optional[int]:
     """Find the row number for a given job ID."""
     try:

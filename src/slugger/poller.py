@@ -40,23 +40,27 @@ def _setup_logging() -> None:
     root.addHandler(handler)
 
 
-def _write_pid() -> None:
-    """Write PID file with restrictive permissions."""
+def _write_pid() -> bool:
+    """Write PID file with restrictive permissions.
+
+    Returns True if this process now owns the PID file.
+    """
     try:
         fd = os.open(str(PID_FILE), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         if is_running():
-            return
+            return False  # Another daemon is active
         PID_FILE.unlink(missing_ok=True)
         try:
             fd = os.open(str(PID_FILE), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
             # Another process won the race — let it be the poller
-            return
+            return False
     try:
         os.write(fd, str(os.getpid()).encode())
     finally:
         os.close(fd)
+    return True
 
 
 def _remove_pid() -> None:
@@ -141,7 +145,9 @@ def _daemonize() -> None:
 
     # Run the polling loop
     _setup_logging()
-    _write_pid()
+    if not _write_pid():
+        # Another poller owns the PID file — exit to prevent orphan daemon
+        os._exit(0)
 
     def handle_sigterm(_signum, _frame):
         logger.info("Poller stopping (SIGTERM)")

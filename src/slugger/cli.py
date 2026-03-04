@@ -15,7 +15,7 @@ from rich.panel import Panel
 from slugger.config import CONFIG_PATH, CREDENTIALS_PATH, ensure_slugger_dir, load_config
 from slugger.models import SluggerConfig
 from slugger.display import console, show_job_detail, show_job_list, show_submit_result
-from slugger.gsheet_sync import create_row, update_row
+from slugger.gsheet_sync import create_row, get_spreadsheet_info, update_row
 from slugger.slurm import submit_job, validate_job_id
 from slugger.store import get_job, get_latest_job, list_all_jobs, save_job
 
@@ -28,6 +28,9 @@ app = typer.Typer(
 
 poller_app = typer.Typer(help="Background poller management.")
 app.add_typer(poller_app, name="poller")
+
+sheet_app = typer.Typer(help="Google Sheets management.")
+app.add_typer(sheet_app, name="sheet")
 
 logger = logging.getLogger("slugger")
 
@@ -135,6 +138,8 @@ def list_cmd(
 def sync(
     job_id: Optional[str] = typer.Argument(None, help="Job ID (default: all active)"),
     project: str = typer.Option("", "--project", "-p", help="Project name filter"),
+    all_jobs: bool = typer.Option(False, "-a", "--all", help="Sync all jobs (including completed)"),
+    unsynced: bool = typer.Option(False, "--unsynced", help="Sync only jobs not yet in sheets"),
 ) -> None:
     """Force sync job(s) to Google Sheets."""
     config = load_config()
@@ -147,6 +152,18 @@ def sync(
             console.print(f"[red]Invalid job ID:[/red] {job_id}")
             raise typer.Exit(1)
         _sync_one(job_id, config)
+    elif all_jobs or unsynced:
+        proj_filter = _resolve_project(project)
+        jobs = list_all_jobs(project=proj_filter)
+        if unsynced:
+            jobs = [j for j in jobs if not j.sheet_row]
+        if not jobs:
+            label = "unsynced " if unsynced else ""
+            console.print(f"[dim]No {label}jobs to sync.[/dim]")
+            return
+        console.print(f"[dim]Syncing {len(jobs)} jobs...[/dim]")
+        for job in jobs:
+            _sync_one(job.job_id, config)
     else:
         from slugger.store import get_active_job_ids
 
@@ -460,3 +477,48 @@ def poller_status() -> None:
         console.print(f"[green]Poller is running[/green] (PID {pid})")
     else:
         console.print("[dim]Poller is not running.[/dim]")
+
+
+@sheet_app.command("info")
+def sheet_info() -> None:
+    """Show connected spreadsheet and worksheet tabs."""
+    config = load_config()
+    if not config.sheet_configured:
+        console.print("[red]Google Sheets not configured. Run 'slugger login' first.[/red]")
+        raise typer.Exit(1)
+
+    console.print("[dim]Fetching spreadsheet info...[/dim]")
+    info = get_spreadsheet_info(config)
+    if info is None:
+        console.print("[red]Failed to connect to spreadsheet.[/red]")
+        console.print(f"[dim]Spreadsheet ID: {config.spreadsheet_id}[/dim]")
+        raise typer.Exit(1)
+
+    from rich.table import Table
+
+    console.print(f"\n[bold]{info['title']}[/bold]")
+    console.print(f"[dim]{info['url']}[/dim]\n")
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Worksheet Tab", style="cyan")
+    table.add_column("Jobs", justify="right")
+
+    for ws in info["worksheets"]:
+        table.add_row(ws["name"], str(ws["rows"]))
+
+    console.print(table)
+
+    # Show unsynced jobs summary
+    all_jobs = list_all_jobs()
+    unsynced = [j for j in all_jobs if not j.sheet_row]
+    if unsynced:
+        console.print(
+            f"\n[yellow]{len(unsynced)} job(s) not synced to sheet.[/yellow]"
+        )
+        for j in unsynced[:5]:
+            console.print(f"  [dim]{j.job_id}[/dim] {j.job_name or j.script} [{j.status.value}]")
+        if len(unsynced) > 5:
+            console.print(f"  [dim]... and {len(unsynced) - 5} more[/dim]")
+        console.print("\n[dim]Run 'slugger sync --unsynced' to push them.[/dim]")
+    else:
+        console.print(f"\n[green]All {len(all_jobs)} job(s) synced.[/green]")
